@@ -1,116 +1,104 @@
-import json
+# src/run_evaluation_mini.py
+"""Evaluate stereotype preference for a subset of prompts using TinyLlama.
+
+This script loads a pretrained causal language model, generates prompts
+from the probes JSON file, computes the log probability of stereotypical
+and anti‑stereotypical completions given each prompt, and writes the
+results to a CSV file.  It can run on CPU or GPU.
+
+Usage:  python run_evaluation_mini.py
+"""
 import csv
+import json
 import os
+import random
+import sys
+from typing import List, Dict
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from generate_prompts import generate_prompts
-import random
 
-# --- Configuration ---
-MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # A powerful, Llama-compatible open model
-PROBES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'probes.json')
-RESULTS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results', 'baseline_results_english.csv')
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # Use GPU if available
+# Model configuration
+MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROBES_FILE = os.path.join(PROJECT_ROOT, 'data', 'probes.json')
+RESULTS_FILE = os.path.join(PROJECT_ROOT, 'results', 'baseline_results_english.csv')
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def calculate_completion_log_prob(prompt, completion, model, tokenizer):
+
+def calculate_completion_log_prob(prompt: str, completion: str,
+                                  model: AutoModelForCausalLM,
+                                  tokenizer: AutoTokenizer) -> float:
+    """Compute the log probability of `completion` given `prompt`.
+
+    Args:
+        prompt: The prompt text (without the completion).
+        completion: The completion to condition on.
+        model: A causal language model.
+        tokenizer: Tokenizer corresponding to the model.
+
+    Returns:
+        The sum of log probabilities of the completion tokens.
     """
-    Calculates the conditional log probability of a completion given a prompt.
-    P(completion | prompt)
-    """
-    # Tokenize the prompt and completion
-    prompt_tokens = tokenizer.encode(prompt, return_tensors='pt').to(DEVICE)
-    completion_tokens = tokenizer.encode(completion, add_special_tokens=False, return_tensors='pt').to(DEVICE)
-    
-    # Combine them for the model input
-    full_tokens = torch.cat([prompt_tokens, completion_tokens], dim=1)
-    
-    # Get the model's logits (raw scores for each token)
+    # Encode tokens; avoid adding special tokens to the completion
+    prompt_ids = tokenizer.encode(prompt, return_tensors='pt').to(DEVICE)
+    comp_ids = tokenizer.encode(completion, add_special_tokens=False, return_tensors='pt').to(DEVICE)
+    # Concatenate prompt and completion
+    input_ids = torch.cat([prompt_ids, comp_ids], dim=1)
     with torch.no_grad():
-        outputs = model(full_tokens)
-        logits = outputs.logits
-
-    # We only care about the logits for the completion tokens
-    # The logits for the first completion token are at the position of the last prompt token
-    completion_logits = logits[:, prompt_tokens.shape[1]-1:-1, :]
-    
-    # Use log_softmax to get log probabilities
+        outputs = model(input_ids)
+    logits = outputs.logits
+    # We only need logits corresponding to completion positions
+    # For position t in completion, logit is at prompt_len + t - 1
+    completion_logits = logits[:, prompt_ids.shape[1]-1:-1, :]
     log_probs = torch.nn.functional.log_softmax(completion_logits, dim=-1)
-    
-    # Gather the log probabilities of the actual completion tokens
-    # completion_tokens needs to be reshaped to be used with gather
-    completion_log_probs = log_probs.gather(2, completion_tokens.unsqueeze(-1)).squeeze(-1)
-    
-    # Sum the log probabilities to get the total sentence log probability
-    return completion_log_probs.sum().item()
+    token_log_probs = log_probs.gather(2, comp_ids.unsqueeze(-1)).squeeze(-1)
+    return float(token_log_probs.sum().cpu().item())
 
 
-def run_evaluation():
-    """
-    Main function to run the entire evaluation pipeline.
-    """
-    print("--- Starting Evaluation ---")
-    
-    # 1. Load Model and Tokenizer
-    print(f"Loading model: {MODEL_ID} onto {DEVICE}...")
-    # Note: For float16, a GPU is recommended. If on CPU, you might need to remove torch_dtype.
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).to(DEVICE)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model.eval() # Set model to evaluation mode
+def run_evaluation(test_cases: List[Dict[str, str]],
+                   result_path: str,
+                   subset_size: int = 200) -> None:
+    """Run evaluation on a subset of test cases and write results to CSV."""
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=(torch.float16 if DEVICE == 'cuda' else None)
+        ).to(DEVICE)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        model.eval()
+    except Exception as e:
+        print(f"Error loading model {MODEL_ID}: {e}")
+        sys.exit(1)
 
-    # 2. Generate all prompts from the JSON file
-    print(f"Generating prompts from {PROBES_FILE}...")
-    all_test_cases = generate_prompts(PROBES_FILE)
-
-    random.shuffle(all_test_cases) # Randomize the order of test cases
-    all_test_cases = all_test_cases[:200] # Take only the first 200 cases for a quick run
-    
-    if not all_test_cases:
-        print("No test cases generated. Exiting.")
-        return
-
-    # 3. Prepare CSV file for results
-    os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
-    with open(RESULTS_FILE, 'w', newline='', encoding='utf-8') as f:
+    # Randomly sample a subset for quick evaluation
+    random.shuffle(test_cases)
+    subset = test_cases[:subset_size]
+    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+    with open(result_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        # Write header
-        header = ["template_id", "demographics", "prompt", 
-                  "log_prob_stereotypical", "log_prob_anti_stereotypical", "stereotype_preference_score"]
-        writer.writerow(header)
-
-        print(f"Starting evaluation of {len(all_test_cases)} test cases...")
-        # 4. Iterate through each test case and get scores
-        for i, case in enumerate(all_test_cases):
+        writer.writerow([
+            'template_id', 'demographics', 'prompt',
+            'log_prob_stereotypical', 'log_prob_anti_stereotypical', 'stereotype_preference_score'
+        ])
+        for idx, case in enumerate(subset, 1):
             prompt = case['prompt']
-            
-            # Get the text of the completions from the full sentences
-            stereo_completion = case['sentence_stereotypical'].replace(prompt, '').strip()
-            anti_stereo_completion = case['sentence_anti_stereotypical'].replace(prompt, '').strip()
-
-            # Calculate log probabilities for both completions
-            log_prob_stereo = calculate_completion_log_prob(prompt, stereo_completion, model, tokenizer)
-            log_prob_anti_stereo = calculate_completion_log_prob(prompt, anti_stereo_completion, model, tokenizer)
-
-            # Calculate the Stereotype Preference Score (log-odds difference)
-            # A positive score means the stereotypical completion is more likely.
-            stereo_score = log_prob_stereo - log_prob_anti_stereo
-
-            # Prepare row for CSV
-            row = [
-                case['template_id'],
-                json.dumps(case['demographics']),
-                prompt,
-                log_prob_stereo,
-                log_prob_anti_stereo,
-                stereo_score
-            ]
-            writer.writerow(row)
-
-            if (i + 1) % 50 == 0:
-                print(f"  ...processed {i+1}/{len(all_test_cases)} cases")
-
-    print(f"--- Evaluation Complete ---")
-    print(f"Results saved to {RESULTS_FILE}")
+            # Extract completions by slicing off the prompt prefix
+            stereo_completion = case['sentence_stereotypical'][len(prompt):].strip()
+            anti_completion = case['sentence_anti_stereotypical'][len(prompt):].strip()
+            lp_stereo = calculate_completion_log_prob(prompt, stereo_completion, model, tokenizer)
+            lp_anti = calculate_completion_log_prob(prompt, anti_completion, model, tokenizer)
+            score = lp_stereo - lp_anti
+            writer.writerow([
+                case['template_id'], json.dumps(case['demographics']), prompt,
+                lp_stereo, lp_anti, score
+            ])
+            if idx % 50 == 0:
+                print(f"Processed {idx}/{len(subset)} cases")
 
 
 if __name__ == '__main__':
-    run_evaluation()
+    cases = generate_prompts(PROBES_FILE)
+    run_evaluation(cases, RESULTS_FILE)
