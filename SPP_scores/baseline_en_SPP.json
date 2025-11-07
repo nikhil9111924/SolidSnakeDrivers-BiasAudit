@@ -1,0 +1,6 @@
+{
+  "file": "results/baseline_with_toxicity.csv",
+  "total_prompts": 200,
+  "stereotypical_preference_count": 124,
+  "stereotype_preference_percentage": 62.0
+}

@@ -1,0 +1,6 @@
+{
+  "file": "results/self_debias_results.csv",
+  "total_prompts": 3189,
+  "stereotypical_preference_count": 1698,
+  "stereotype_preference_percentage": 53.25
+}
