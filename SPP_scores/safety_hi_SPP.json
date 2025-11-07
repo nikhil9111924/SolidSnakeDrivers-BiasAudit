@@ -1,0 +1,6 @@
+{
+  "file": "results/mitigation_results_hi_safety.csv",
+  "total_prompts": 3189,
+  "stereotypical_preference_count": 2253,
+  "stereotype_preference_percentage": 70.65
+}
